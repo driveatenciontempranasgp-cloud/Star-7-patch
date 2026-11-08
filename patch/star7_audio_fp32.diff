@@ -1,0 +1,133 @@
+--- a/nodes.py
++++ b/nodes.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import sys
+ import weakref
+ from collections import Counter
+@@ -26,6 +27,17 @@
+ K_OUT_PROJ = 64.0
+ K_FC2 = 256.0
+ 
++# --- Star7 audio/FP32-carrier patch (local, not upstream) -------------------
++# STAR7_FP32_CARRIER=1 (default): the DIFFUSION_MODEL boundary hands FP32
++# context/latents to every wrapper (Spectrum, caches) so their forecasts and
++# caches of the FP32 residual are not rounded/clamped to FP16 (+-65504). The
++# native H3 _forward gets its context cast back to FP16, so inner compute is
++# unchanged. The final audio/video head runs with FP32 modulation.
++# Set STAR7_FP32_CARRIER=0 to get the original upstream behaviour.
++AUDIO_PATCH_VERSION = "audiofp32-1"
++FP32_CARRIER = os.environ.get("STAR7_FP32_CARRIER", "1").strip().lower() not in ("0", "false", "no", "off")
++INNER_CONTEXT_DTYPE_KEY = "star7_h3_inner_context_dtype"
++
+ _te_logged_runtime = ContextVar("star7_h3_fp16_te_logged_runtime", default=None)
+ 
+ _PROCESS_WIDE_CONFLICT_MARKERS = (
+@@ -164,6 +176,41 @@
+     return forward
+ 
+ 
++def _final_layer_forward(original_forward):
++    def forward(self, x, t_emb, *args, **kwargs):
++        # FP32 modulation for the output heads (audio_out/video_out are already
++        # the checkpoint's FP32 island); only the tiny adaLN projection changes.
++        if torch.is_tensor(x) and x.dtype != torch.float32:
++            x = x.to(torch.float32)
++        if torch.is_tensor(t_emb) and t_emb.dtype != torch.float32:
++            t_emb = t_emb.to(torch.float32)
++        return original_forward(x, t_emb, *args, **kwargs)
++
++    return forward
++
++
++def _inner_forward(original_forward):
++    def forward(self, x, timestep, context, transformer_options={}, *args, **kwargs):
++        # Undo the FP32 carrier right at the native H3 core so the packed
++        # sequence, t_emb and RoPE table keep the protected FP16 policy.
++        inner_dtype = None
++        if isinstance(transformer_options, dict):
++            inner_dtype = transformer_options.get(INNER_CONTEXT_DTYPE_KEY)
++        if inner_dtype is not None and torch.is_tensor(context) and context.dtype != inner_dtype:
++            context = context.to(dtype=inner_dtype)
++        return original_forward(x, timestep, context, transformer_options, *args, **kwargs)
++
++    return forward
++
++
++def _to_fp32_carrier(value):
++    if torch.is_tensor(value):
++        return value.to(torch.float32) if value.is_floating_point() and value.dtype != torch.float32 else value
++    if isinstance(value, (list, tuple)):
++        return type(value)(_to_fp32_carrier(item) for item in value)
++    return value
++
++
+ def _block_forward(original_forward, minimax_module):
+     def forward(
+         self, x, t_emb, mod_segments, rope_freqs, transformer_options={},
+@@ -209,6 +256,23 @@
+ ):
+     """Protect H3's TE-facing packed residual carrier without changing compute ops."""
+     runtime = _commercial_te_runtime(transformer_options)
++    if runtime is None and FP32_CARRIER and isinstance(context, torch.Tensor) and isinstance(transformer_options, dict):
++        inner_dtype = context.dtype
++        if inner_dtype == torch.float32:
++            return executor(x, timestep, context, transformer_options, *args, **kwargs)
++        options = dict(transformer_options)
++        options[INNER_CONTEXT_DTYPE_KEY] = inner_dtype
++        if _te_logged_runtime.get() != "fp32-carrier":
++            logging.info(
++                "[Star7 H3 FP16] FP32 carrier active (%s) | wrappers/forecast=FP32 | "
++                "inner compute=%s/INT8 | audio/video head=FP32",
++                AUDIO_PATCH_VERSION,
++                str(inner_dtype).replace("torch.", "").upper(),
++            )
++            _te_logged_runtime.set("fp32-carrier")
++        return executor(
++            _to_fp32_carrier(x), timestep, context.to(dtype=torch.float32), options, *args, **kwargs
++        )
+     if runtime is None or not isinstance(context, torch.Tensor):
+         return executor(x, timestep, context, transformer_options, *args, **kwargs)
+ 
+@@ -324,6 +388,23 @@
+         ),
+     )
+ 
++    if FP32_CARRIER:
++        patched.add_object_patch(
++            "diffusion_model._forward",
++            _weak_method(
++                diffusion_model,
++                _inner_forward(_weak_callable(diffusion_model._forward)),
++            ),
++        )
++        final_layer = diffusion_model.final_layer
++        patched.add_object_patch(
++            "diffusion_model.final_layer.forward",
++            _weak_method(
++                final_layer,
++                _final_layer_forward(_weak_callable(final_layer.forward)),
++            ),
++        )
++
+     for index, block in enumerate(diffusion_model.blocks):
+         out_proj = block.attn.out_proj
+         patched.add_object_patch(
+@@ -352,13 +433,15 @@
+     weight_patches = len(getattr(patched, "patches", {}))
+     backend = _format_quantization(quant_formats) if is_quantized else "dense-fp16"
+     logging.info(
+-        "[Star7 H3 FP16] Enabled v%s | mode=%s | backend=%s | force-cast=%s | weight-patches=%d | blocks=%d",
++        "[Star7 H3 FP16] Enabled v%s | mode=%s | backend=%s | force-cast=%s | weight-patches=%d | blocks=%d | fp32-carrier=%s (%s)",
+         NODE_VERSION,
+         mode,
+         backend,
+         bool(patched.force_cast_weights),
+         weight_patches,
+         len(diffusion_model.blocks),
++        "on" if FP32_CARRIER else "off",
++        AUDIO_PATCH_VERSION,
+     )
+     if is_quantized and weight_patches:
+         logging.warning(
